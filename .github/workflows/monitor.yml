@@ -1,0 +1,50 @@
+name: monitor-externo
+# Vigia POR FORA dos servidores da NexPhi (09/10/2026). Se a API, a tela, o
+# Portal ou o Painel não responderem, a execução falha e o GitHub manda e-mail.
+# O resultado vai também para o Painel de Servidores (batimento); se o
+# batimento parar, o vigia interno avisa no WhatsApp.
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: monitor
+  cancel-in-progress: false
+
+jobs:
+  checar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4
+    steps:
+      - name: Checar os sites
+        env:
+          MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
+          EXECUCAO: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -u
+          checar() {  # nome url  -> 2 tentativas, 20 s entre elas
+            local nome=$1 url=$2 cod ms
+            for t in 1 2; do
+              read -r cod ms < <(curl -s -o /dev/null -m 15 -A "nexphi-monitor-externo" -w "%{http_code} %{time_total}" "$url" || echo "000 0")
+              ms=$(awk "BEGIN{print int($ms*1000)}")
+              if [ "$cod" -ge 200 ] && [ "$cod" -lt 400 ]; then echo "{\"nome\":\"$nome\",\"ok\":true,\"status\":$cod,\"ms\":$ms}"; return 0; fi
+              [ $t = 1 ] && sleep 20
+            done
+            echo "{\"nome\":\"$nome\",\"ok\":false,\"status\":$cod,\"ms\":$ms}"; return 1
+          }
+          falhou=0; itens=()
+          for par in "nxp-api https://nxp-api.nexphi.com.br/health" "nxp https://nxp.nexphi.com.br/" \
+                     "portal https://portal.nexphi.com.br/" "painel https://servidores.nexphi.com.br/health"; do
+            set -- $par
+            item=$(checar "$1" "$2") || falhou=1
+            echo "$item"; itens+=("$item")
+          done
+          ok=$([ $falhou = 0 ] && echo true || echo false)
+          corpo="{\"ok\":$ok,\"execucao\":\"$EXECUCAO\",\"checagens\":[$(IFS=,; echo "${itens[*]}")]}"
+          curl -s -o /dev/null -m 15 -w "batimento no painel: %{http_code}\n" -X POST \
+            https://servidores.nexphi.com.br/api/externo/batimento \
+            -H "content-type: application/json" -H "X-Monitor-Token: $MONITOR_TOKEN" -d "$corpo" || echo "painel sem resposta"
+          if [ $falhou = 1 ]; then echo "::error::NexPhi fora do ar visto de fora"; exit 1; fi
