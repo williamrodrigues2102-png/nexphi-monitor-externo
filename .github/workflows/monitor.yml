@@ -3,12 +3,20 @@ name: monitor-externo
 # Portal ou o Painel não responderem, a execução falha e o GitHub manda e-mail.
 # O resultado vai também para o Painel de Servidores (batimento); se o
 # batimento parar, o vigia interno avisa no WhatsApp.
+#
+# 11/10/2026: o agendamento */5 do GitHub atrasa horas em repo de pouca atividade
+# (rodava ~a cada 3–6 h), e o disparo de fora (cron no Linode) parava junto com o
+# Linode. Agora a corrente é do próprio GitHub: cada rodada, ao terminar, dispara
+# a próxima (~5 min depois do início). O agendamento abaixo fica só de reserva,
+# para religar a corrente se ela quebrar. O grupo de concorrência garante no
+# máximo 1 rodando + 1 na fila, então correntes duplicadas se fundem.
 on:
   schedule:
     - cron: "*/5 * * * *"
   workflow_dispatch:
 
-permissions: {}
+permissions:
+  actions: write   # só para disparar a próxima rodada
 
 concurrency:
   group: monitor
@@ -17,8 +25,11 @@ concurrency:
 jobs:
   checar:
     runs-on: ubuntu-latest
-    timeout-minutes: 4
+    timeout-minutes: 9
     steps:
+      - name: Marcar o início
+        run: date +%s > /tmp/inicio
+
       - name: Checar os sites
         env:
           MONITOR_TOKEN: ${{ secrets.MONITOR_TOKEN }}
@@ -48,3 +59,14 @@ jobs:
             https://servidores.nexphi.com.br/api/externo/batimento \
             -H "content-type: application/json" -H "X-Monitor-Token: $MONITOR_TOKEN" -d "$corpo" || echo "painel sem resposta"
           if [ $falhou = 1 ]; then echo "::error::NexPhi fora do ar visto de fora"; exit 1; fi
+
+      - name: Encadear a próxima rodada
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # espera completar ~5 min desde o início do job e dispara a próxima
+          falta=$(( 290 - $(( $(date +%s) - $(cat /tmp/inicio 2>/dev/null || date +%s) )) ))
+          if [ $falta -gt 0 ]; then sleep $falta; fi
+          gh workflow run monitor.yml -R "${{ github.repository }}" --ref "${{ github.ref_name }}" \
+            && echo "próxima rodada disparada" || echo "::warning::não consegui disparar a próxima (o agendamento religa)"
